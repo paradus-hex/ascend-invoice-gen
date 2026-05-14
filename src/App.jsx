@@ -143,13 +143,14 @@ function Editable({
       contentEditable
       suppressContentEditableWarning
       data-placeholder={placeholder}
+      onInput={(e) => {
+        onSave(e.currentTarget.innerText);
+      }}
       onBlur={(e) => {
-        let text = e.currentTarget.innerText;
-        if (!text.trim()) {
+        if (!e.currentTarget.innerText.trim()) {
           e.currentTarget.innerHTML = '';
-          text = '';
+          onSave('');
         }
-        onSave(text);
       }}
       onKeyDown={(e) => {
         if (!multiline && e.key === 'Enter') {
@@ -745,6 +746,9 @@ export default function App() {
   );
 
   const saveTimers = useRef({});
+  const pendingInvoices = useRef({});
+  const bizTimer = useRef(null);
+  const pendingBiz = useRef(null);
 
   // ----- Auth state -----
   useEffect(() => {
@@ -844,27 +848,78 @@ export default function App() {
   // ----- Debounced business-info save -----
   useEffect(() => {
     if (!dataReady || !user) return;
-    const t = setTimeout(() => {
-      setDoc(businessInfoDoc(user.uid), businessInfo).catch((e) =>
+    pendingBiz.current = businessInfo;
+    if (bizTimer.current) clearTimeout(bizTimer.current);
+    bizTimer.current = setTimeout(() => {
+      bizTimer.current = null;
+      const payload = pendingBiz.current;
+      pendingBiz.current = null;
+      setDoc(businessInfoDoc(user.uid), payload).catch((e) =>
         console.error('Save business info failed:', e),
       );
     }, 400);
-    return () => clearTimeout(t);
+    return () => {
+      if (bizTimer.current) clearTimeout(bizTimer.current);
+    };
   }, [businessInfo, dataReady, user]);
 
   // ----- Per-invoice debounced save -----
   const scheduleSave = useCallback(
     (invoice) => {
       if (!user) return;
+      pendingInvoices.current[invoice.id] = invoice;
       if (saveTimers.current[invoice.id]) clearTimeout(saveTimers.current[invoice.id]);
       saveTimers.current[invoice.id] = setTimeout(() => {
-        setDoc(invoiceDoc(user.uid, invoice.id), invoice).catch((e) =>
+        delete saveTimers.current[invoice.id];
+        const payload = pendingInvoices.current[invoice.id];
+        delete pendingInvoices.current[invoice.id];
+        setDoc(invoiceDoc(user.uid, invoice.id), payload).catch((e) =>
           console.error('Save invoice failed:', e),
         );
       }, 400);
     },
     [user],
   );
+
+  // ----- Flush pending saves before the page unloads or tab hides -----
+  useEffect(() => {
+    if (!user) return;
+    const flush = () => {
+      Object.keys(saveTimers.current).forEach((id) => {
+        clearTimeout(saveTimers.current[id]);
+        delete saveTimers.current[id];
+        const payload = pendingInvoices.current[id];
+        if (payload) {
+          delete pendingInvoices.current[id];
+          setDoc(invoiceDoc(user.uid, id), payload).catch((e) =>
+            console.error('Flush invoice failed:', e),
+          );
+        }
+      });
+      if (bizTimer.current) {
+        clearTimeout(bizTimer.current);
+        bizTimer.current = null;
+        const payload = pendingBiz.current;
+        if (payload) {
+          pendingBiz.current = null;
+          setDoc(businessInfoDoc(user.uid), payload).catch((e) =>
+            console.error('Flush business info failed:', e),
+          );
+        }
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+    window.addEventListener('beforeunload', flush);
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', flush);
+    return () => {
+      window.removeEventListener('beforeunload', flush);
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', flush);
+    };
+  }, [user]);
 
   const currentInvoice = invoices.find((i) => i.id === currentInvoiceId);
 
