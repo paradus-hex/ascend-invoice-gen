@@ -2,7 +2,7 @@
 
 A WYSIWYG invoice generator. Sign in with Google, click any text on the invoice to edit it, invoices sync to the cloud via Firebase.
 
-## Features
+## Featuress
 - Sign in with Google — each user gets their own private workspace
 - Click-to-edit fields anywhere on the invoice
 - Multiple line items, auto-summing totals
