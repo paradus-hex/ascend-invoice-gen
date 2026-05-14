@@ -110,12 +110,33 @@ const projectsCol = (uid) => collection(db, 'users', uid, 'projects');
 const projectDoc = (uid, id) => doc(db, 'users', uid, 'projects', id);
 const businessInfoDoc = (uid) => doc(db, 'users', uid, 'meta', 'businessInfo');
 
+// Synchronous write-ahead log so edits made within the debounce window
+// survive a refresh even if the async Firestore write can't finish before
+// the page unloads. Replayed on next load.
+const pendingPrefix = (uid) => `ascend-pending-invoice:${uid}:`;
+const pendingKey = (uid, id) => `${pendingPrefix(uid)}${id}`;
+const writePendingBackup = (uid, invoice) => {
+  try {
+    localStorage.setItem(pendingKey(uid, invoice.id), JSON.stringify(invoice));
+  } catch (e) {
+    console.error('Backup pending invoice failed:', e);
+  }
+};
+const clearPendingBackup = (uid, id) => {
+  try {
+    localStorage.removeItem(pendingKey(uid, id));
+  } catch {
+    // ignore
+  }
+};
+
 /* ============================================================
    Editable — click-to-edit contentEditable wrapper
    ============================================================ */
 function Editable({
   initialValue,
   onSave,
+  onCommit,
   placeholder = '',
   className = '',
   style = {},
@@ -151,6 +172,7 @@ function Editable({
           e.currentTarget.innerHTML = '';
           onSave('');
         }
+        if (onCommit) onCommit();
       }}
       onKeyDown={(e) => {
         if (!multiline && e.key === 'Enter') {
@@ -240,7 +262,8 @@ function SignInScreen() {
 /* ============================================================
    Invoice Paper — the printable invoice itself
    ============================================================ */
-function InvoicePaper({ invoice, businessInfo, totalDue, updateInvoice }) {
+function InvoicePaper({ invoice, businessInfo, totalDue, updateInvoice, flushSave }) {
+  const commitNow = () => flushSave && flushSave(invoice.id);
   const updateClient = (field, value) =>
     updateInvoice((inv) => ({ ...inv, client: { ...inv.client, [field]: value } }));
 
@@ -312,6 +335,7 @@ function InvoicePaper({ invoice, businessInfo, totalDue, updateInvoice }) {
           <Editable
             initialValue={invoice.client?.name}
             onSave={(v) => updateClient('name', v)}
+            onCommit={commitNow}
             placeholder="Client Name"
             className="inv-client-name"
           />
@@ -321,6 +345,7 @@ function InvoicePaper({ invoice, businessInfo, totalDue, updateInvoice }) {
               <Editable
                 initialValue={invoice.client?.phone}
                 onSave={(v) => updateClient('phone', v)}
+                onCommit={commitNow}
                 placeholder="+1 (000) 000-0000"
               />
             </div>
@@ -329,6 +354,7 @@ function InvoicePaper({ invoice, businessInfo, totalDue, updateInvoice }) {
               <Editable
                 initialValue={invoice.client?.email}
                 onSave={(v) => updateClient('email', v)}
+                onCommit={commitNow}
                 placeholder="client@email.com"
               />
             </div>
@@ -337,6 +363,7 @@ function InvoicePaper({ invoice, businessInfo, totalDue, updateInvoice }) {
               <Editable
                 initialValue={invoice.client?.address}
                 onSave={(v) => updateClient('address', v)}
+                onCommit={commitNow}
                 placeholder="Address"
                 multiline
               />
@@ -354,6 +381,7 @@ function InvoicePaper({ invoice, businessInfo, totalDue, updateInvoice }) {
               <Editable
                 initialValue={invoice.invoiceNumber}
                 onSave={(v) => updateInvoice({ invoiceNumber: v })}
+                onCommit={commitNow}
                 placeholder="000000-00000"
               />
             </div>
@@ -362,6 +390,7 @@ function InvoicePaper({ invoice, businessInfo, totalDue, updateInvoice }) {
               <Editable
                 initialValue={invoice.date}
                 onSave={(v) => updateInvoice({ date: v })}
+                onCommit={commitNow}
                 placeholder="DD/MM/YYYY"
               />
             </div>
@@ -384,6 +413,7 @@ function InvoicePaper({ invoice, businessInfo, totalDue, updateInvoice }) {
                 <Editable
                   initialValue={item.service}
                   onSave={(v) => updateLineItem(item.id, 'service', v)}
+                  onCommit={commitNow}
                   placeholder="Service"
                   multiline
                   className="inv-service-text"
@@ -393,6 +423,7 @@ function InvoicePaper({ invoice, businessInfo, totalDue, updateInvoice }) {
                 <Editable
                   initialValue={item.description}
                   onSave={(v) => updateLineItem(item.id, 'description', v)}
+                  onCommit={commitNow}
                   placeholder="Description"
                   multiline
                   className="inv-desc-text"
@@ -404,6 +435,7 @@ function InvoicePaper({ invoice, businessInfo, totalDue, updateInvoice }) {
                   <Editable
                     initialValue={item.total ? String(item.total) : ''}
                     onSave={(v) => updateLineItem(item.id, 'total', v)}
+                    onCommit={commitNow}
                     placeholder="0"
                     className="inv-amount"
                   />
@@ -749,6 +781,7 @@ export default function App() {
   const pendingInvoices = useRef({});
   const bizTimer = useRef(null);
   const pendingBiz = useRef(null);
+  const restoredForUid = useRef(null);
 
   // ----- Auth state -----
   useEffect(() => {
@@ -787,8 +820,34 @@ export default function App() {
     const unsubInvoices = onSnapshot(
       query(invoicesCol(user.uid), orderBy('updatedAt', 'desc')),
       (snap) => {
-        const invs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-        setInvoices(invs);
+        const fromSnap = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        // Don't let a stale snapshot clobber an in-flight local edit.
+        // If we have a newer pending invoice (about to be / just saved),
+        // keep the local version instead of the snapshot's version.
+        setInvoices((prev) => {
+          const prevById = new Map(prev.map((i) => [i.id, i]));
+          const pendingIds = new Set(Object.keys(pendingInvoices.current));
+          const merged = fromSnap.map((snapInv) => {
+            const local = prevById.get(snapInv.id);
+            if (!local) return snapInv;
+            if (
+              pendingIds.has(snapInv.id) ||
+              (local.updatedAt || 0) > (snapInv.updatedAt || 0)
+            ) {
+              return local;
+            }
+            return snapInv;
+          });
+          // Preserve any purely-local invoices that haven't yet shown up
+          // in the snapshot (e.g. just-created blanks mid-sync).
+          fromSnap.forEach((s) => prevById.delete(s.id));
+          prevById.forEach((local) => {
+            if (pendingIds.has(local.id)) merged.push(local);
+          });
+          return merged.sort(
+            (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0),
+          );
+        });
         setInvsLoaded(true);
       },
       (err) => {
@@ -845,6 +904,57 @@ export default function App() {
     }
   }, [dataReady, invoices, currentInvoiceId, user]);
 
+  // ----- Replay any localStorage-backed edits that didn't finish saving
+  //       before the last unload. Runs once per signed-in user. -----
+  useEffect(() => {
+    if (!dataReady || !user) return;
+    if (restoredForUid.current === user.uid) return;
+    restoredForUid.current = user.uid;
+
+    const prefix = pendingPrefix(user.uid);
+    const restored = [];
+    const keysToScan = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(prefix)) keysToScan.push(key);
+    }
+    keysToScan.forEach((key) => {
+      try {
+        const raw = localStorage.getItem(key);
+        if (!raw) return;
+        const payload = JSON.parse(raw);
+        if (!payload || !payload.id) {
+          localStorage.removeItem(key);
+          return;
+        }
+        const existing = invoices.find((inv) => inv.id === payload.id);
+        if (!existing || (payload.updatedAt || 0) > (existing.updatedAt || 0)) {
+          restored.push(payload);
+        } else {
+          localStorage.removeItem(key);
+        }
+      } catch (e) {
+        console.error('Read pending backup failed:', e);
+        localStorage.removeItem(key);
+      }
+    });
+
+    if (restored.length === 0) return;
+
+    setInvoices((prev) => {
+      const byId = new Map(prev.map((i) => [i.id, i]));
+      restored.forEach((r) => byId.set(r.id, r));
+      return Array.from(byId.values()).sort(
+        (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0),
+      );
+    });
+    restored.forEach((r) => {
+      setDoc(invoiceDoc(user.uid, r.id), r)
+        .then(() => clearPendingBackup(user.uid, r.id))
+        .catch((e) => console.error('Restore pending invoice failed:', e));
+    });
+  }, [dataReady, user, invoices]);
+
   // ----- Debounced business-info save -----
   useEffect(() => {
     if (!dataReady || !user) return;
@@ -867,16 +977,47 @@ export default function App() {
   const scheduleSave = useCallback(
     (invoice) => {
       if (!user) return;
+      writePendingBackup(user.uid, invoice);
       pendingInvoices.current[invoice.id] = invoice;
       if (saveTimers.current[invoice.id]) clearTimeout(saveTimers.current[invoice.id]);
       saveTimers.current[invoice.id] = setTimeout(() => {
         delete saveTimers.current[invoice.id];
         const payload = pendingInvoices.current[invoice.id];
         delete pendingInvoices.current[invoice.id];
-        setDoc(invoiceDoc(user.uid, invoice.id), payload).catch((e) =>
-          console.error('Save invoice failed:', e),
-        );
-      }, 400);
+        setDoc(invoiceDoc(user.uid, invoice.id), payload)
+          .then(() => {
+            // Only clear the backup if no newer edit has been scheduled.
+            const newer = pendingInvoices.current[invoice.id];
+            if (!newer || (newer.updatedAt || 0) <= (payload.updatedAt || 0)) {
+              clearPendingBackup(user.uid, invoice.id);
+            }
+          })
+          .catch((e) => console.error('Save invoice failed:', e));
+      }, 200);
+    },
+    [user],
+  );
+
+  // Immediately persist the most recent pending edit for an invoice,
+  // bypassing the debounce. Used on blur so leaving a field commits.
+  const flushSave = useCallback(
+    (invoiceId) => {
+      if (!user || !invoiceId) return;
+      if (saveTimers.current[invoiceId]) {
+        clearTimeout(saveTimers.current[invoiceId]);
+        delete saveTimers.current[invoiceId];
+      }
+      const payload = pendingInvoices.current[invoiceId];
+      if (!payload) return;
+      delete pendingInvoices.current[invoiceId];
+      setDoc(invoiceDoc(user.uid, invoiceId), payload)
+        .then(() => {
+          const newer = pendingInvoices.current[invoiceId];
+          if (!newer || (newer.updatedAt || 0) <= (payload.updatedAt || 0)) {
+            clearPendingBackup(user.uid, invoiceId);
+          }
+        })
+        .catch((e) => console.error('Flush save failed:', e));
     },
     [user],
   );
@@ -891,9 +1032,12 @@ export default function App() {
         const payload = pendingInvoices.current[id];
         if (payload) {
           delete pendingInvoices.current[id];
-          setDoc(invoiceDoc(user.uid, id), payload).catch((e) =>
-            console.error('Flush invoice failed:', e),
-          );
+          // Backup is already in localStorage (written by scheduleSave); the
+          // setDoc below may not complete before unload, so the backup is the
+          // safety net that gets replayed on next load.
+          setDoc(invoiceDoc(user.uid, id), payload)
+            .then(() => clearPendingBackup(user.uid, id))
+            .catch((e) => console.error('Flush invoice failed:', e));
         }
       });
       if (bizTimer.current) {
@@ -1383,6 +1527,7 @@ export default function App() {
             businessInfo={businessInfo}
             totalDue={totalDue}
             updateInvoice={updateInvoice}
+            flushSave={flushSave}
           />
 
           <div className="workspace-spacer" />
