@@ -13,6 +13,12 @@ import {
   LogOut,
   Cloud,
   CloudOff,
+  Folder,
+  FolderPlus,
+  ChevronDown,
+  ChevronRight,
+  Pencil,
+  Inbox,
 } from 'lucide-react';
 import {
   onAuthStateChanged,
@@ -85,12 +91,13 @@ const defaultBusinessInfo = {
   footerMessage: 'Looking forward to our continued collaboration.',
 };
 
-const createBlankInvoice = (existing) => ({
+const createBlankInvoice = (existing, projectId = null) => ({
   id: newId('inv_'),
   invoiceNumber: nextInvoiceNumber(existing),
   date: formatDate(new Date()),
   client: { name: '', phone: '', email: '', address: '' },
   lineItems: [{ id: newId('li_'), service: '', description: '', total: 0 }],
+  projectId,
   updatedAt: Date.now(),
 });
 
@@ -99,6 +106,8 @@ const createBlankInvoice = (existing) => ({
    ============================================================ */
 const invoicesCol = (uid) => collection(db, 'users', uid, 'invoices');
 const invoiceDoc = (uid, id) => doc(db, 'users', uid, 'invoices', id);
+const projectsCol = (uid) => collection(db, 'users', uid, 'projects');
+const projectDoc = (uid, id) => doc(db, 'users', uid, 'projects', id);
 const businessInfoDoc = (uid) => doc(db, 'users', uid, 'meta', 'businessInfo');
 
 /* ============================================================
@@ -625,6 +634,92 @@ function SettingsModal({ businessInfo, setBusinessInfo, user, onSignOut, onClose
 }
 
 /* ============================================================
+   Project header — inline rename + drop target + actions
+   ============================================================ */
+function ProjectHeader({
+  project,
+  count,
+  collapsed,
+  isEditing,
+  isDropTarget,
+  onToggle,
+  onStartEdit,
+  onCommitEdit,
+  onDelete,
+  onAddInvoice,
+  onDragOver,
+  onDragLeave,
+  onDrop,
+}) {
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    if (isEditing && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [isEditing]);
+
+  return (
+    <div
+      className={`project-header ${isDropTarget ? 'drop-target' : ''}`}
+      onClick={() => {
+        if (!isEditing) onToggle();
+      }}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      <span className="project-chevron">
+        {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+      </span>
+      <Folder size={13} className="project-folder-icon" />
+      {isEditing ? (
+        <input
+          ref={inputRef}
+          className="project-name-input"
+          defaultValue={project.name}
+          onClick={(e) => e.stopPropagation()}
+          onBlur={(e) => onCommitEdit(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') e.currentTarget.blur();
+            if (e.key === 'Escape') onCommitEdit(project.name);
+          }}
+        />
+      ) : (
+        <span className="project-name" title={project.name}>
+          {project.name}
+        </span>
+      )}
+      <span className="project-count">{count}</span>
+      <span className="project-actions" onClick={(e) => e.stopPropagation()}>
+        <button
+          className="project-action-btn"
+          title="Add invoice to folder"
+          onClick={onAddInvoice}
+        >
+          <Plus size={12} strokeWidth={2.5} />
+        </button>
+        <button
+          className="project-action-btn"
+          title="Rename folder"
+          onClick={onStartEdit}
+        >
+          <Pencil size={11} strokeWidth={2.25} />
+        </button>
+        <button
+          className="project-action-btn danger"
+          title="Delete folder"
+          onClick={onDelete}
+        >
+          <Trash2 size={11} strokeWidth={2.25} />
+        </button>
+      </span>
+    </div>
+  );
+}
+
+/* ============================================================
    Main App
    ============================================================ */
 export default function App() {
@@ -633,12 +728,17 @@ export default function App() {
 
   const [businessInfo, setBusinessInfo] = useState(defaultBusinessInfo);
   const [invoices, setInvoices] = useState([]);
+  const [projects, setProjects] = useState([]);
   const [currentInvoiceId, setCurrentInvoiceId] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [collapsedProjects, setCollapsedProjects] = useState(() => new Set());
+  const [editingProjectId, setEditingProjectId] = useState(null);
+  const [dragOverTarget, setDragOverTarget] = useState(null);
 
   const [bizLoaded, setBizLoaded] = useState(false);
   const [invsLoaded, setInvsLoaded] = useState(false);
-  const dataReady = bizLoaded && invsLoaded;
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
+  const dataReady = bizLoaded && invsLoaded && projectsLoaded;
 
   const [online, setOnline] = useState(
     typeof navigator !== 'undefined' ? navigator.onLine : true,
@@ -653,10 +753,12 @@ export default function App() {
       setAuthStatus(u ? 'signedIn' : 'signedOut');
       if (!u) {
         setInvoices([]);
+        setProjects([]);
         setCurrentInvoiceId(null);
         setBusinessInfo(defaultBusinessInfo);
         setBizLoaded(false);
         setInvsLoaded(false);
+        setProjectsLoaded(false);
       }
     });
     return unsub;
@@ -705,9 +807,22 @@ export default function App() {
       },
     );
 
+    const unsubProjects = onSnapshot(
+      query(projectsCol(user.uid), orderBy('createdAt', 'asc')),
+      (snap) => {
+        setProjects(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+        setProjectsLoaded(true);
+      },
+      (err) => {
+        console.error('Projects subscription error:', err);
+        setProjectsLoaded(true);
+      },
+    );
+
     return () => {
       unsubInvoices();
       unsubBiz();
+      unsubProjects();
     };
   }, [user]);
 
@@ -772,14 +887,93 @@ export default function App() {
     [currentInvoiceId, scheduleSave],
   );
 
-  const newInvoice = () => {
+  const newInvoice = (projectId = null) => {
     if (!user) return;
-    const blank = createBlankInvoice(invoices);
+    const blank = createBlankInvoice(invoices, projectId);
     setInvoices((prev) => [blank, ...prev]);
     setCurrentInvoiceId(blank.id);
     setDoc(invoiceDoc(user.uid, blank.id), blank).catch((e) =>
       console.error('Create invoice failed:', e),
     );
+  };
+
+  const createProject = () => {
+    if (!user) return;
+    const proj = {
+      id: newId('prj_'),
+      name: 'Untitled folder',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    setProjects((prev) => [...prev, proj]);
+    setEditingProjectId(proj.id);
+    setDoc(projectDoc(user.uid, proj.id), proj).catch((e) =>
+      console.error('Create project failed:', e),
+    );
+  };
+
+  const renameProject = (id, name) => {
+    if (!user) return;
+    const trimmed = (name || '').trim() || 'Untitled folder';
+    const existing = projects.find((p) => p.id === id);
+    if (!existing) return;
+    const updated = { ...existing, name: trimmed, updatedAt: Date.now() };
+    setProjects((prev) => prev.map((p) => (p.id === id ? updated : p)));
+    setDoc(projectDoc(user.uid, id), updated).catch((e) =>
+      console.error('Rename project failed:', e),
+    );
+  };
+
+  const deleteProject = (id) => {
+    if (!user) return;
+    if (
+      !confirm(
+        'Delete this folder? Invoices inside will move to Unfiled.',
+      )
+    )
+      return;
+    setProjects((prev) => prev.filter((p) => p.id !== id));
+    deleteDoc(projectDoc(user.uid, id)).catch((e) =>
+      console.error('Delete project failed:', e),
+    );
+    const affected = invoices.filter((i) => i.projectId === id);
+    if (affected.length > 0) {
+      setInvoices((prev) =>
+        prev.map((i) => (i.projectId === id ? { ...i, projectId: null } : i)),
+      );
+      affected.forEach((inv) => {
+        const updated = { ...inv, projectId: null, updatedAt: Date.now() };
+        setDoc(invoiceDoc(user.uid, inv.id), updated).catch((e) =>
+          console.error('Unfile invoice failed:', e),
+        );
+      });
+    }
+  };
+
+  const moveInvoiceToProject = (invoiceId, projectId) => {
+    if (!user) return;
+    const inv = invoices.find((i) => i.id === invoiceId);
+    if (!inv) return;
+    const targetId = projectId || null;
+    if ((inv.projectId || null) === targetId) return;
+    const updated = { ...inv, projectId: targetId, updatedAt: Date.now() };
+    setInvoices((prev) =>
+      prev
+        .map((i) => (i.id === invoiceId ? updated : i))
+        .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)),
+    );
+    setDoc(invoiceDoc(user.uid, invoiceId), updated).catch((e) =>
+      console.error('Move invoice failed:', e),
+    );
+  };
+
+  const toggleProjectCollapsed = (id) => {
+    setCollapsedProjects((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   };
 
   const duplicateInvoice = () => {
@@ -831,6 +1025,58 @@ export default function App() {
 
   const downloadPDF = () => {
     window.print();
+  };
+
+  // ----- Grouping helpers -----
+  const projectIdSet = new Set(projects.map((p) => p.id));
+  const unfiledInvoices = invoices.filter(
+    (i) => !i.projectId || !projectIdSet.has(i.projectId),
+  );
+  const invoicesByProject = invoices.reduce((acc, inv) => {
+    if (inv.projectId && projectIdSet.has(inv.projectId)) {
+      (acc[inv.projectId] ||= []).push(inv);
+    }
+    return acc;
+  }, {});
+
+  const handleInvoiceDragStart = (e, invoiceId) => {
+    e.dataTransfer.setData('text/plain', invoiceId);
+    e.dataTransfer.effectAllowed = 'move';
+  };
+
+  const renderInvoiceItem = (inv) => {
+    const t = sumLineItems(inv.lineItems);
+    return (
+      <div
+        key={inv.id}
+        className={`invoice-item ${inv.id === currentInvoiceId ? 'active' : ''}`}
+        draggable
+        onDragStart={(e) => handleInvoiceDragStart(e, inv.id)}
+        onClick={() => setCurrentInvoiceId(inv.id)}
+      >
+        <div className="invoice-item-main">
+          <div className="invoice-item-client">
+            {inv.client?.name || 'Untitled invoice'}
+          </div>
+          <div className="invoice-item-num">
+            {inv.invoiceNumber || 'No number'} · {inv.date}
+          </div>
+        </div>
+        <div className="invoice-item-meta">
+          <div className="invoice-item-amount">${formatCurrency(t)}</div>
+          <button
+            className="delete-btn"
+            onClick={(e) => {
+              e.stopPropagation();
+              deleteInvoice(inv.id);
+            }}
+            title="Delete"
+          >
+            <Trash2 size={13} />
+          </button>
+        </div>
+      </div>
+    );
   };
 
   // ----- Render guards -----
@@ -905,44 +1151,111 @@ export default function App() {
             </div>
           </div>
 
-          <button className="new-btn" onClick={newInvoice}>
-            <FilePlus2 size={15} strokeWidth={2.25} /> New invoice
-          </button>
+          <div className="sidebar-actions">
+            <button className="new-btn" onClick={() => newInvoice()}>
+              <FilePlus2 size={15} strokeWidth={2.25} /> New invoice
+            </button>
+            <button
+              className="new-folder-btn"
+              onClick={createProject}
+              title="Create a folder to organise invoices"
+            >
+              <FolderPlus size={14} strokeWidth={2.25} /> New folder
+            </button>
+          </div>
 
           <div className="invoice-list">
-            {invoices.length === 0 && <div className="empty">No invoices yet</div>}
-            {invoices.map((inv) => {
-              const t = sumLineItems(inv.lineItems);
-              return (
-                <div
-                  key={inv.id}
-                  className={`invoice-item ${inv.id === currentInvoiceId ? 'active' : ''}`}
-                  onClick={() => setCurrentInvoiceId(inv.id)}
-                >
-                  <div className="invoice-item-main">
-                    <div className="invoice-item-client">
-                      {inv.client?.name || 'Untitled invoice'}
-                    </div>
-                    <div className="invoice-item-num">
-                      {inv.invoiceNumber || 'No number'} · {inv.date}
-                    </div>
+            {invoices.length === 0 && projects.length === 0 && (
+              <div className="empty">No invoices yet</div>
+            )}
+
+            {projects.length === 0
+              ? invoices.map((inv) => renderInvoiceItem(inv))
+              : (
+                <>
+                  <div
+                    className={`unfiled-header ${
+                      dragOverTarget === 'unfiled' ? 'drop-target' : ''
+                    }`}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = 'move';
+                      setDragOverTarget('unfiled');
+                    }}
+                    onDragLeave={(e) => {
+                      if (e.currentTarget.contains(e.relatedTarget)) return;
+                      setDragOverTarget((t) => (t === 'unfiled' ? null : t));
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      const id = e.dataTransfer.getData('text/plain');
+                      setDragOverTarget(null);
+                      if (id) moveInvoiceToProject(id, null);
+                    }}
+                  >
+                    <Inbox size={12} className="project-folder-icon" />
+                    <span className="project-name">Unfiled</span>
+                    <span className="project-count">{unfiledInvoices.length}</span>
                   </div>
-                  <div className="invoice-item-meta">
-                    <div className="invoice-item-amount">${formatCurrency(t)}</div>
-                    <button
-                      className="delete-btn"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        deleteInvoice(inv.id);
-                      }}
-                      title="Delete"
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
+                  {unfiledInvoices.map((inv) => renderInvoiceItem(inv))}
+
+                  {projects.map((proj) => {
+                    const projectInvoices = invoicesByProject[proj.id] || [];
+                    const collapsed = collapsedProjects.has(proj.id);
+                    return (
+                      <div
+                        key={proj.id}
+                        className="project-section"
+                        onDragOver={(e) => {
+                          e.preventDefault();
+                          e.dataTransfer.dropEffect = 'move';
+                          setDragOverTarget(proj.id);
+                        }}
+                        onDragLeave={(e) => {
+                          if (e.currentTarget.contains(e.relatedTarget)) return;
+                          setDragOverTarget((t) => (t === proj.id ? null : t));
+                        }}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          const id = e.dataTransfer.getData('text/plain');
+                          setDragOverTarget(null);
+                          if (id) moveInvoiceToProject(id, proj.id);
+                        }}
+                      >
+                        <ProjectHeader
+                          project={proj}
+                          count={projectInvoices.length}
+                          collapsed={collapsed}
+                          isEditing={editingProjectId === proj.id}
+                          isDropTarget={dragOverTarget === proj.id}
+                          onToggle={() => toggleProjectCollapsed(proj.id)}
+                          onStartEdit={() => setEditingProjectId(proj.id)}
+                          onCommitEdit={(name) => {
+                            renameProject(proj.id, name);
+                            setEditingProjectId(null);
+                          }}
+                          onDelete={() => deleteProject(proj.id)}
+                          onAddInvoice={() => {
+                            setCollapsedProjects((prev) => {
+                              const next = new Set(prev);
+                              next.delete(proj.id);
+                              return next;
+                            });
+                            newInvoice(proj.id);
+                          }}
+                        />
+                        {!collapsed && projectInvoices.length === 0 && (
+                          <div className="project-empty">
+                            Drag invoices here or click + to add
+                          </div>
+                        )}
+                        {!collapsed &&
+                          projectInvoices.map((inv) => renderInvoiceItem(inv))}
+                      </div>
+                    );
+                  })}
+                </>
+              )}
           </div>
 
           <div className="sidebar-footer">
@@ -977,6 +1290,30 @@ export default function App() {
               </span>
             </div>
             <div className="toolbar-actions">
+              <label className="project-picker" title="Move to folder">
+                <Folder size={13} strokeWidth={2.25} />
+                <select
+                  value={
+                    currentInvoice.projectId &&
+                    projectIdSet.has(currentInvoice.projectId)
+                      ? currentInvoice.projectId
+                      : ''
+                  }
+                  onChange={(e) =>
+                    moveInvoiceToProject(
+                      currentInvoice.id,
+                      e.target.value || null,
+                    )
+                  }
+                >
+                  <option value="">Unfiled</option>
+                  {projects.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <button className="tool-btn" onClick={duplicateInvoice}>
                 <Copy size={14} strokeWidth={2.25} /> Duplicate
               </button>
@@ -1227,6 +1564,36 @@ const globalStyles = `
   }
   .new-btn:hover { opacity: 0.92; }
   .new-btn:active { transform: scale(0.985); }
+
+  .sidebar-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .new-folder-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    background: transparent;
+    color: rgba(0,0,0,0.65);
+    border: 1px dashed rgba(0,0,0,0.18);
+    padding: 7px 12px;
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+  }
+  .new-folder-btn:hover {
+    border-color: rgba(0,0,0,0.4);
+    color: #141414;
+    background: rgba(0,0,0,0.02);
+  }
+  .new-folder-btn:active { transform: scale(0.985); }
+
   .invoice-list {
     flex: 1;
     overflow-y: auto;
@@ -1235,6 +1602,148 @@ const globalStyles = `
     gap: 2px;
     margin: 0 -4px;
     padding: 0 4px;
+  }
+
+  /* Project folders */
+  .project-section {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    border-radius: 8px;
+    padding: 2px;
+    margin: 4px -2px 0;
+    transition: background 0.12s, box-shadow 0.12s;
+  }
+  .project-section.drop-target,
+  .project-section:has(.project-header.drop-target) {
+    background: rgba(20,20,20,0.05);
+    box-shadow: inset 0 0 0 1px rgba(20,20,20,0.18);
+  }
+  .project-header,
+  .unfiled-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 9px;
+    border-radius: 6px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.12s;
+  }
+  .project-header:hover { background: rgba(0,0,0,0.04); }
+  .project-header.drop-target,
+  .unfiled-header.drop-target {
+    background: rgba(20,20,20,0.09);
+  }
+  .unfiled-header {
+    margin-top: 2px;
+    cursor: default;
+    color: rgba(0,0,0,0.55);
+  }
+  .project-chevron {
+    display: flex;
+    color: rgba(0,0,0,0.45);
+  }
+  .project-folder-icon {
+    color: rgba(0,0,0,0.55);
+    flex-shrink: 0;
+  }
+  .project-name {
+    flex: 1;
+    min-width: 0;
+    font-size: 12.5px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .project-name-input {
+    flex: 1;
+    min-width: 0;
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    padding: 2px 5px;
+    margin: -2px -5px;
+    border: 1px solid rgba(0,0,0,0.18);
+    border-radius: 5px;
+    background: white;
+    color: #141414;
+    outline: none;
+  }
+  .project-name-input:focus { border-color: #141414; }
+  .project-count {
+    font-size: 10.5px;
+    font-weight: 600;
+    color: rgba(0,0,0,0.45);
+    background: rgba(0,0,0,0.05);
+    padding: 2px 6px;
+    border-radius: 10px;
+    font-variant-numeric: tabular-nums;
+    min-width: 18px;
+    text-align: center;
+  }
+  .project-actions {
+    display: flex;
+    gap: 1px;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .project-header:hover .project-actions { opacity: 1; }
+  .project-action-btn {
+    background: transparent;
+    border: none;
+    padding: 4px;
+    border-radius: 5px;
+    cursor: pointer;
+    color: rgba(0,0,0,0.5);
+    transition: background 0.12s, color 0.12s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .project-action-btn:hover { background: rgba(0,0,0,0.07); color: #141414; }
+  .project-action-btn.danger:hover {
+    background: rgba(200,30,30,0.1);
+    color: #c01919;
+  }
+  .project-empty {
+    font-size: 11.5px;
+    color: rgba(0,0,0,0.35);
+    padding: 8px 10px 8px 28px;
+    font-style: italic;
+  }
+  .invoice-item[draggable=true] { cursor: grab; }
+  .invoice-item[draggable=true]:active { cursor: grabbing; }
+
+  /* Toolbar project picker */
+  .project-picker {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: white;
+    border: 1px solid rgba(0,0,0,0.13);
+    padding: 6px 10px 6px 11px;
+    border-radius: 8px;
+    color: rgba(0,0,0,0.7);
+    transition: border-color 0.15s;
+    cursor: pointer;
+  }
+  .project-picker:hover { border-color: rgba(0,0,0,0.32); }
+  .project-picker select {
+    appearance: none;
+    border: none;
+    background: transparent;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: #141414;
+    cursor: pointer;
+    outline: none;
+    padding-right: 2px;
+    max-width: 180px;
   }
   .empty {
     text-align: center;
