@@ -1084,21 +1084,24 @@ export default function App() {
 
   const updateInvoice = useCallback(
     (updater) => {
-      let updated = null;
+      // Compute the new invoice synchronously from current state so we can
+      // hand the exact same object to both setInvoices and scheduleSave.
+      // (Reading a variable mutated *inside* the setInvoices updater is
+      // unreliable — React doesn't always run that updater synchronously,
+      // so most keystrokes' saves were silently dropped.)
+      const base = invoices.find((i) => i.id === currentInvoiceId);
+      if (!base) return;
+      const next =
+        typeof updater === 'function' ? updater(base) : { ...base, ...updater };
+      const updated = { ...next, updatedAt: Date.now() };
       setInvoices((prev) =>
         prev
-          .map((inv) => {
-            if (inv.id !== currentInvoiceId) return inv;
-            const next =
-              typeof updater === 'function' ? updater(inv) : { ...inv, ...updater };
-            updated = { ...next, updatedAt: Date.now() };
-            return updated;
-          })
+          .map((inv) => (inv.id === currentInvoiceId ? updated : inv))
           .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)),
       );
-      if (updated) scheduleSave(updated);
+      scheduleSave(updated);
     },
-    [currentInvoiceId, scheduleSave],
+    [invoices, currentInvoiceId, scheduleSave],
   );
 
   const newInvoice = (projectId = null) => {
