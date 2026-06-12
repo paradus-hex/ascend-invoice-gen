@@ -771,6 +771,11 @@ export default function App() {
   const [bizLoaded, setBizLoaded] = useState(false);
   const [invsLoaded, setInvsLoaded] = useState(false);
   const [projectsLoaded, setProjectsLoaded] = useState(false);
+  // True once the invoices listener has heard from the server (not just the
+  // local cache). We only conclude "the user has no invoices" — and create a
+  // starter blank — after this, so a cold-cache empty first snapshot can't
+  // spawn a phantom blank that hides real data on refresh.
+  const [invoicesSynced, setInvoicesSynced] = useState(false);
   const dataReady = bizLoaded && invsLoaded && projectsLoaded;
 
   const [online, setOnline] = useState(
@@ -796,6 +801,7 @@ export default function App() {
         setBizLoaded(false);
         setInvsLoaded(false);
         setProjectsLoaded(false);
+        setInvoicesSynced(false);
       }
     });
     return unsub;
@@ -849,6 +855,9 @@ export default function App() {
           );
         });
         setInvsLoaded(true);
+        // Once the server (not just the cache) has answered, we can trust an
+        // empty result to really mean "no invoices."
+        if (!snap.metadata.fromCache) setInvoicesSynced(true);
       },
       (err) => {
         console.error('Invoices subscription error:', err);
@@ -892,17 +901,23 @@ export default function App() {
   // ----- After initial fetch: pick a current invoice / create blank if empty -----
   useEffect(() => {
     if (!dataReady || !user) return;
-    if (invoices.length === 0 && currentInvoiceId === null) {
+    if (invoices.length > 0) {
+      if (!currentInvoiceId) setCurrentInvoiceId(invoices[0].id);
+      return;
+    }
+    // No invoices in state. Only create a starter blank once we're sure the
+    // list is genuinely empty — i.e. the server has confirmed it, or we're
+    // offline and the cache is all we'll get. Otherwise a cold-cache empty
+    // first snapshot would spawn a phantom blank that hides real data.
+    if (currentInvoiceId === null && (invoicesSynced || !online)) {
       const blank = createBlankInvoice([]);
       setInvoices([blank]);
       setCurrentInvoiceId(blank.id);
       setDoc(invoiceDoc(user.uid, blank.id), blank).catch((e) =>
         console.error('Create blank invoice failed:', e),
       );
-    } else if (!currentInvoiceId && invoices.length > 0) {
-      setCurrentInvoiceId(invoices[0].id);
     }
-  }, [dataReady, invoices, currentInvoiceId, user]);
+  }, [dataReady, invoices, currentInvoiceId, user, invoicesSynced, online]);
 
   // ----- Replay any localStorage-backed edits that didn't finish saving
   //       before the last unload. Runs once per signed-in user. -----
